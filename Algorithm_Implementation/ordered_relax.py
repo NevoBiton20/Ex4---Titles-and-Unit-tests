@@ -12,6 +12,7 @@ import pulp
 """
 Parameters
 ----------
+
 voters : list[set[str]]
     A list representing the voters. Each element is a set of project names
     approved by one voter.
@@ -37,16 +38,10 @@ budget : float
     The total available budget. The total cost of the selected projects
     must not exceed this value.
 
-Returns
--------
-set[str]
-    A set containing the names of the selected projects.
+Returns a set[str] containing the names of the selected projects.
 
-Raises
-------
-ValueError
-    If the budget is negative, if a project has a negative cost, or if a
-    voter approves a project that does not appear in the costs dictionary.
+Raises ValueError If the budget is negative, if a project has a negative cost, or if a 
+voter approves a project that does not appear in the costs dictionary.
 
 The algorithm receives a set of projects, their costs, a budget limit,
 and the approval sets of the voters. It first solves a linear relaxation
@@ -58,8 +53,6 @@ order as long as the budget constraint is not violated.
 def ordered_relax(voters: list[set[str]], costs: dict[str, float], budget: float,) -> set[str]:
     
     """
-    Run the ORDERED-RELAX algorithm for Maxmin Participatory Budgeting.
-
     The input is:
     - voters: list of approval sets, where voters[i] is the approval set of voter i
     - costs: dictionary mapping each project to its cost
@@ -178,3 +171,7 @@ def ordered_relax(voters: list[set[str]], costs: dict[str, float], budget: float
     True
     """
     pass
+
+if __name__ == "__main__":
+    import doctest
+    doctest.testmod()
