@@ -1,74 +1,109 @@
-from ordered_relax import ordered_relax
-"""
-Pytest tests for ordered_relax.
-
-Run with:
-    python -m pytest test_ordered_relax.py -v
-"""
-
 from itertools import combinations
 import random
+
 import pytest
+from pulp import (
+    HiGHS,
+    LpMaximize,
+    LpProblem,
+    LpStatusOptimal,
+    LpVariable,
+    lpSum,
+    value,
+)
+
+from pabutools.election import (
+    ApprovalBallot,
+    ApprovalMultiProfile,
+    ApprovalProfile,
+    Instance,
+    Project,
+    total_cost,
+)
+from pabutools.rules import ordered_relax
+from pabutools.rules.budgetallocation import BudgetAllocation
 
 
-def total_cost(projects: set[str], costs: dict[str, float]) -> float:
-    return sum(costs[p] for p in projects)
+EPS = 1e-7
 
 
-def voter_utility(selected: set[str], voter: set[str], costs: dict[str, float]) -> float:
-    return sum(costs[p] for p in selected & voter)
+def make_election(costs_by_name, budget, approvals_by_name):
+    projects_by_name = {
+        name: Project(name, cost)
+        for name, cost in costs_by_name.items()
+    }
+
+    instance = Instance(projects_by_name.values(), budget_limit=budget)
+
+    profile = ApprovalProfile(
+        [
+            ApprovalBallot({projects_by_name[name] for name in ballot})
+            for ballot in approvals_by_name
+        ]
+    )
+
+    return instance, profile, projects_by_name
 
 
-def mpb_value(selected: set[str], voters: list[set[str]], costs: dict[str, float]) -> float:
-    if not voters:
+def selected_names(outcome):
+    return {p.name for p in outcome}
+
+
+def voter_utility(outcome, ballot):
+    return sum(p.cost for p in outcome if p in ballot)
+
+
+def mpb_value(outcome, profile):
+    if len(profile) == 0:
         return 0.0
-    return min(voter_utility(selected, voter, costs) for voter in voters)
+    return min(voter_utility(outcome, ballot) for ballot in profile)
 
 
-def all_feasible_subsets(projects: list[str], costs: dict[str, float], budget: float):
-    for r in range(len(projects) + 1):
-        for subset_tuple in combinations(projects, r):
-            subset = set(subset_tuple)
-            if total_cost(subset, costs) <= budget:
-                yield subset
+def assert_valid_budget_allocation(outcome, instance):
+    assert isinstance(outcome, BudgetAllocation)
+    assert set(outcome) <= set(instance)
+    assert total_cost(outcome) <= instance.budget_limit + EPS
 
 
-def brute_force_opt(voters: list[set[str]], costs: dict[str, float], budget: float) -> float:
+def exact_mpb_value_by_ilp(instance, profile):
     """
-    Exact OPT by brute force.
+    Compute the exact MPB optimum by solving the binary ILP.
 
-    Use only for small / medium instances, because this is O(2^m).
+    This is used only inside tests to check the additive guarantee from
+    Lemma 1.
     """
-    projects = list(costs.keys())
-    best = 0.0
+    if len(profile) == 0:
+        return 0.0
 
-    for subset in all_feasible_subsets(projects, costs, budget):
-        best = max(best, mpb_value(subset, voters, costs))
+    projects = list(instance)
 
-    return best
+    prob = LpProblem("ExactMPB", LpMaximize)
+
+    x = {
+        p: LpVariable(f"x_{idx}", cat="Binary")
+        for idx, p in enumerate(projects)
+    }
+
+    q = LpVariable("q", lowBound=0)
+
+    for ballot in profile:
+        prob += q <= lpSum(p.cost * x[p] for p in projects if p in ballot)
+
+    prob += lpSum(p.cost * x[p] for p in projects) <= instance.budget_limit
+    prob += q
+
+    status = prob.solve(HiGHS(msg=False))
+
+    assert status == LpStatusOptimal
+
+    return float(value(q) or 0.0)
 
 
-def assert_valid_output(
-    selected: set[str],
-    voters: list[set[str]],
-    costs: dict[str, float],
-    budget: float,
-):
-    assert isinstance(selected, set)
-    assert selected <= set(costs.keys())
-    assert total_cost(selected, costs) <= budget
-
-
-def assert_lemma_guarantee(
-    selected: set[str],
-    voters: list[set[str]],
-    costs: dict[str, float],
-    budget: float,
-):
+def assert_ordered_relax_additive_guarantee(outcome, instance, profile):
     """
-    Checks Lemma 1 guarantee:
+    Check Lemma 1:
 
-        ALG >= OPT - eta * (budget - OPT)
+        ALG >= OPT - eta * (b - OPT)
 
     where:
         ALG = min_i u_i(S)
@@ -76,290 +111,400 @@ def assert_lemma_guarantee(
         eta = |A_j \\ S| / |S \\ A_j|
         j = argmin_i u_i(S)
 
-    This requires brute-force OPT, so use it only when the number of projects
-    is not too large.
+    Degenerate cases in which the denominator is 0 are skipped, because the
+    formula is not numerically defined there.
     """
-    if not voters:
+    if len(profile) == 0:
         return
 
-    alg = mpb_value(selected, voters, costs)
-    opt = brute_force_opt(voters, costs, budget)
+    selected = set(outcome)
+    alg = mpb_value(outcome, profile)
+    opt = exact_mpb_value_by_ilp(instance, profile)
 
-    utilities = [
-        voter_utility(selected, voter, costs)
-        for voter in voters
+    utilities = [voter_utility(outcome, ballot) for ballot in profile]
+    worst_utility = min(utilities)
+
+    # Try all worst-off voters and use one for which eta is defined.
+    worst_indices = [
+        idx
+        for idx, utility in enumerate(utilities)
+        if abs(utility - worst_utility) <= EPS
     ]
-    worst_value = min(utilities)
-    j = utilities.index(worst_value)
-    worst_voter = voters[j]
 
-    denominator = len(selected - worst_voter)
+    eta = None
 
-    # The Lemma formula uses division by |S \\ A_j|.
-    # If denominator is 0, the expression is not numerically usable here.
-    if denominator == 0:
-        pytest.skip("Lemma eta is undefined because |S \\ A_j| = 0")
+    for idx in worst_indices:
+        ballot = set(profile[idx])
+        denominator = len(selected - ballot)
 
-    eta = len(worst_voter - selected) / denominator
-    lower_bound = opt - eta * (budget - opt)
+        if denominator > 0:
+            eta = len(ballot - selected) / denominator
+            break
 
-    assert alg >= lower_bound
+    if eta is None:
+        pytest.skip("Lemma 1 eta is undefined for all worst-off voters.")
+
+    lower_bound = opt - eta * (instance.budget_limit - opt)
+
+    assert alg + EPS >= lower_bound
 
 
+# ---------------------------------------------------------
+# Manual examples
+# ---------------------------------------------------------
+
+
+def test_ordered_relax_example_1_size_1():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 5},
+        budget=5,
+        approvals_by_name=[
+            {"p1"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p1"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+def test_ordered_relax_example_2_size_2():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 4, "p2": 3},
+        budget=4,
+        approvals_by_name=[
+            {"p1"},
+            {"p2"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p1"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+def test_ordered_relax_example_3_size_3():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 3, "p2": 3, "p3": 2},
+        budget=5,
+        approvals_by_name=[
+            {"p1", "p2"},
+            {"p2"},
+            {"p3"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p2", "p3"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+def test_ordered_relax_example_4_optimal_case():
+    instance, profile, _ = make_election(
+        costs_by_name={
+            "p0": 2,
+            "p1": 3,
+            "p2": 3,
+            "p3": 3,
+            "p4": 3,
+        },
+        budget=8,
+        approvals_by_name=[
+            {"p0", "p1"},
+            {"p0", "p2"},
+            {"p0", "p3"},
+            {"p0", "p4"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p0", "p1", "p2"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+def test_ordered_relax_example_5_bad_case():
+    instance, profile, _ = make_election(
+        costs_by_name={
+            "p0": 23,
+            "p1": 68,
+            "p2": 198,
+            "p3": 189,
+            "p4": 146,
+            "p5": 38,
+        },
+        budget=341,
+        approvals_by_name=[
+            {"p4"},
+            {"p1", "p2"},
+            {"p1", "p3", "p5"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p4"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+def test_ordered_relax_example_6_large_manual_case():
+    instance, profile, _ = make_election(
+        costs_by_name={
+            "p0": 18,
+            "p1": 45,
+            "p2": 43,
+            "p3": 32,
+            "p4": 28,
+            "p5": 32,
+            "p6": 5,
+            "p7": 37,
+            "p8": 43,
+            "p9": 17,
+        },
+        budget=124,
+        approvals_by_name=[
+            {"p0", "p3", "p7"},
+            {"p1", "p4", "p6", "p7"},
+            {"p0", "p2", "p4", "p5"},
+            {"p1", "p6", "p9"},
+            {"p1", "p2", "p6", "p7", "p8"},
+            {"p1", "p3", "p4", "p6", "p8"},
+        ],
+    )
+
+    outcome = ordered_relax(instance, profile)
+
+    assert selected_names(outcome) == {"p1", "p2"}
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
+
+
+# ---------------------------------------------------------
 # Edge cases
-
-def test_empty_voters_and_empty_costs():
-    voters = []
-    costs = {}
-    budget = 10
-
-    selected = ordered_relax(voters, costs, budget)
-
-    assert selected == set()
-    assert_valid_output(selected, voters, costs, budget)
+# ---------------------------------------------------------
 
 
-def test_no_projects_but_some_voters():
-    voters = [
-        set(),
-        set(),
-        set(),
-    ]
-    costs = {}
-    budget = 10
+def test_ordered_relax_empty_instance_and_empty_profile():
+    instance = Instance([], budget_limit=10)
+    profile = ApprovalProfile([])
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert selected == set()
-    assert_valid_output(selected, voters, costs, budget)
+    assert selected_names(outcome) == set()
+    assert_valid_budget_allocation(outcome, instance)
 
 
-def test_zero_budget_returns_empty_set():
-    voters = [
-        {"p1"},
-        {"p2"},
-    ]
-    costs = {
-        "p1": 5,
-        "p2": 7,
-    }
-    budget = 0
+def test_ordered_relax_no_projects_some_empty_ballots():
+    instance = Instance([], budget_limit=10)
+    profile = ApprovalProfile(
+        [
+            ApprovalBallot(),
+            ApprovalBallot(),
+        ]
+    )
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert selected == set()
-    assert_valid_output(selected, voters, costs, budget)
+    assert selected_names(outcome) == set()
+    assert_valid_budget_allocation(outcome, instance)
 
 
-def test_project_too_expensive_returns_empty_or_feasible():
-    voters = [
-        {"p1"},
-    ]
-    costs = {
-        "p1": 100,
-    }
-    budget = 10
+def test_ordered_relax_zero_budget_returns_empty_allocation():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 5, "p2": 7},
+        budget=0,
+        approvals_by_name=[
+            {"p1"},
+            {"p2"},
+        ],
+    )
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert_valid_output(selected, voters, costs, budget)
-    assert selected == set()
-
-
-def test_projects_not_approved_by_anyone_are_allowed_but_output_is_feasible():
-    voters = [
-        {"p1"},
-        {"p2"},
-    ]
-    costs = {
-        "p1": 5,
-        "p2": 5,
-        "unused": 1,
-    }
-    budget = 6
-
-    selected = ordered_relax(voters, costs, budget)
-
-    assert_valid_output(selected, voters, costs, budget)
+    assert selected_names(outcome) == set()
+    assert_valid_budget_allocation(outcome, instance)
 
 
-# Wrong input tests
+def test_ordered_relax_project_too_expensive_is_not_selected():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 100},
+        budget=10,
+        approvals_by_name=[
+            {"p1"},
+        ],
+    )
 
-def test_negative_budget_raises_value_error():
-    voters = [
-        {"p1"},
-    ]
-    costs = {
-        "p1": 5,
-    }
+    outcome = ordered_relax(instance, profile)
 
-    with pytest.raises(ValueError):
-        ordered_relax(voters, costs, -1)
+    assert selected_names(outcome) == set()
+    assert_valid_budget_allocation(outcome, instance)
 
 
-def test_negative_cost_raises_value_error():
-    voters = [
-        {"p1"},
-    ]
-    costs = {
-        "p1": -5,
-    }
-    budget = 10
+def test_ordered_relax_initial_budget_allocation_is_preserved():
+    instance, profile, projects = make_election(
+        costs_by_name={"p1": 2, "p2": 3, "p3": 4},
+        budget=5,
+        approvals_by_name=[
+            {"p1", "p2"},
+            {"p1", "p3"},
+        ],
+    )
+
+    outcome = ordered_relax(
+        instance,
+        profile,
+        initial_budget_allocation=[projects["p1"]],
+    )
+
+    assert projects["p1"] in outcome
+    assert_valid_budget_allocation(outcome, instance)
+
+
+def test_ordered_relax_initial_budget_allocation_over_budget_raises_value_error():
+    instance, profile, projects = make_election(
+        costs_by_name={"p1": 10},
+        budget=5,
+        approvals_by_name=[
+            {"p1"},
+        ],
+    )
 
     with pytest.raises(ValueError):
-        ordered_relax(voters, costs, budget)
+        ordered_relax(
+            instance,
+            profile,
+            initial_budget_allocation=[projects["p1"]],
+        )
 
 
-def test_voter_approves_unknown_project_raises_value_error():
-    voters = [
-        {"p1", "unknown_project"},
-    ]
-    costs = {
-        "p1": 5,
-    }
-    budget = 10
+def test_ordered_relax_irresolute_outcome_not_supported():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 1},
+        budget=1,
+        approvals_by_name=[
+            {"p1"},
+        ],
+    )
 
-    with pytest.raises(ValueError):
-        ordered_relax(voters, costs, budget)
-
-
-def test_non_set_voter_raises_value_error():
-    voters = [
-        ["p1"],  #should be {"p1"}
-    ]
-    costs = {
-        "p1": 5,
-    }
-    budget = 10
-
-    with pytest.raises(ValueError):
-        ordered_relax(voters, costs, budget)
+    with pytest.raises(NotImplementedError):
+        ordered_relax(instance, profile, resoluteness=False)
 
 
-# Random small tests with exact OPT
+def test_ordered_relax_multiprofile_not_supported():
+    instance, profile, _ = make_election(
+        costs_by_name={"p1": 1},
+        budget=1,
+        approvals_by_name=[
+            {"p1"},
+        ],
+    )
 
-def generate_random_instance(
-    *,
-    seed: int,
-    num_voters: int,
-    num_projects: int,
-    min_cost: int = 1,
-    max_cost: int = 20,
-    approval_probability: float = 0.35,
+    multiprofile = ApprovalMultiProfile(profile=profile)
+
+    with pytest.raises(NotImplementedError):
+        ordered_relax(instance, multiprofile)
+
+
+# ---------------------------------------------------------
+# Random tests
+# ---------------------------------------------------------
+
+
+def generate_random_election(
+    seed,
+    num_voters,
+    num_projects,
+    min_cost=1,
+    max_cost=50,
+    approval_probability=0.3,
 ):
     rng = random.Random(seed)
 
-    projects = [f"p{i}" for i in range(num_projects)]
-
-    costs = {
-        p: rng.randint(min_cost, max_cost)
-        for p in projects
+    costs_by_name = {
+        f"p{i}": rng.randint(min_cost, max_cost)
+        for i in range(num_projects)
     }
 
-    total = sum(costs.values())
+    total = sum(costs_by_name.values())
     budget = rng.randint(max(1, total // 4), max(1, total // 2))
 
-    voters = []
+    project_names = list(costs_by_name)
+
+    approvals_by_name = []
     for _ in range(num_voters):
-        approval_set = {
-            p for p in projects
+        ballot = {
+            p
+            for p in project_names
             if rng.random() < approval_probability
         }
 
-        # Avoid empty approval sets in most random tests.
-        if not approval_set:
-            approval_set.add(rng.choice(projects))
+        if not ballot:
+            ballot.add(rng.choice(project_names))
 
-        voters.append(approval_set)
+        approvals_by_name.append(ballot)
 
-    return voters, costs, budget
+    return make_election(costs_by_name, budget, approvals_by_name)
 
 
 @pytest.mark.parametrize("seed", range(20))
-def test_random_small_instances_satisfy_feasibility_and_lemma(seed):
-    voters, costs, budget = generate_random_instance(
+def test_ordered_relax_random_small_instances(seed):
+    instance, profile, _ = generate_random_election(
         seed=seed,
-        num_voters=4,
-        num_projects=10,
+        num_voters=5,
+        num_projects=12,
         min_cost=1,
-        max_cost=25,
+        max_cost=30,
         approval_probability=0.4,
     )
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert_valid_output(selected, voters, costs, budget)
-    assert_lemma_guarantee(selected, voters, costs, budget)
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
 
 
 @pytest.mark.parametrize("seed", range(20, 30))
-def test_random_medium_instances_satisfy_feasibility_and_lemma(seed):
-    """
-    15 projects means brute force checks 2^15 = 32768 subsets,
-    which is still usually fine for pytest.
-    """
-    voters, costs, budget = generate_random_instance(
+def test_ordered_relax_random_medium_instances(seed):
+    instance, profile, _ = generate_random_election(
         seed=seed,
-        num_voters=6,
-        num_projects=15,
+        num_voters=8,
+        num_projects=20,
         min_cost=1,
-        max_cost=40,
+        max_cost=50,
         approval_probability=0.35,
     )
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert_valid_output(selected, voters, costs, budget)
-    assert_lemma_guarantee(selected, voters, costs, budget)
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
 
 
-
-# Big tests
-# -----------------------------------------------------------------
-# For truly big inputs, exact OPT is expensive.
-# Therefore these tests check validity, feasibility, and stability.
-
-@pytest.mark.parametrize("seed", range(100, 110))
-def test_big_random_inputs_are_feasible(seed):
-    voters, costs, budget = generate_random_instance(
+@pytest.mark.slow
+@pytest.mark.parametrize("seed", range(100, 103))
+def test_ordered_relax_random_big_instances_with_ilp_guarantee(seed):
+    """
+    These are larger tests. They still check the additive guarantee, but they
+    solve an exact ILP to compute OPT, so they are marked as slow.
+    """
+    instance, profile, _ = generate_random_election(
         seed=seed,
-        num_voters=50,
-        num_projects=100,
+        num_voters=15,
+        num_projects=35,
         min_cost=1,
-        max_cost=100,
-        approval_probability=0.15,
+        max_cost=80,
+        approval_probability=0.25,
     )
 
-    selected = ordered_relax(voters, costs, budget)
+    outcome = ordered_relax(instance, profile)
 
-    assert_valid_output(selected, voters, costs, budget)
-
-
-def test_large_dense_input_is_feasible():
-    voters, costs, budget = generate_random_instance(
-        seed=999,
-        num_voters=100,
-        num_projects=150,
-        min_cost=1,
-        max_cost=50,
-        approval_probability=0.5,
-    )
-
-    selected = ordered_relax(voters, costs, budget)
-
-    assert_valid_output(selected, voters, costs, budget)
-
-
-def test_large_sparse_input_is_feasible():
-    voters, costs, budget = generate_random_instance(
-        seed=1000,
-        num_voters=100,
-        num_projects=150,
-        min_cost=1,
-        max_cost=50,
-        approval_probability=0.05,
-    )
-
-    selected = ordered_relax(voters, costs, budget)
-
-    assert_valid_output(selected, voters, costs, budget)
+    assert_valid_budget_allocation(outcome, instance)
+    assert_ordered_relax_additive_guarantee(outcome, instance, profile)
