@@ -1,177 +1,205 @@
-'''
-An implementation of the algorithm described in:
-
-"Maxmin Participatory Budgeting", by Gogulapati Sreedurga , Mayank Ratan Bhardwaj and Y. Narahari, 2022, https://arxiv.org/pdf/2204.13923
-
-Programmer: Nevo Biton
-Date: 2026-04-29
-'''
-
-import pulp
-
 """
-Parameters
-----------
-
-voters : list[set[str]]
-    A list representing the voters. Each element is a set of project names
-    approved by one voter.
-
-    Example:
-    [
-        {"p1", "p2"},
-        {"p2", "p3"},
-        {"p1"}
-    ]
-
-costs : dict[str, float]
-    A dictionary mapping each project name to its cost.
-
-    Example:
-    {
-        "p1": 3,
-        "p2": 5,
-        "p3": 2
-    }
-
-budget : float
-    The total available budget. The total cost of the selected projects
-    must not exceed this value.
-
-Returns a set[str] containing the names of the selected projects.
-
-Raises ValueError If the budget is negative, if a project has a negative cost, or if a 
-voter approves a project that does not appear in the costs dictionary.
-
-The algorithm receives a set of projects, their costs, a budget limit,
-and the approval sets of the voters. It first solves a linear relaxation
-of the max-min participatory budgeting problem, where each project may be
-selected fractionally. Then, it orders the projects according to their
-fractional values in the LP solution and greedily selects projects in that
-order as long as the budget constraint is not violated.
+The Ordered-Relax rule.
 """
-def ordered_relax(voters: list[set[str]], costs: dict[str, float], budget: float,) -> set[str]:
-    
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Collection
+from math import isclose
+
+from pulp import (
+    HiGHS,
+    LpMaximize,
+    LpProblem,
+    LpStatusOptimal,
+    LpVariable,
+    lpSum,
+    value,
+)
+
+from pabutools.election import (
+    AbstractApprovalProfile,
+    ApprovalMultiProfile,
+    Instance,
+    Project,
+    total_cost,
+)
+from pabutools.rules.budgetallocation import BudgetAllocation
+from pabutools.tiebreaking import TieBreakingRule, lexico_tie_breaking
+
+logger = logging.getLogger(__name__)
+
+
+def ordered_relax(
+    instance: Instance,
+    profile: AbstractApprovalProfile,
+    initial_budget_allocation: Collection[Project] | None = None,
+    tie_breaking: TieBreakingRule | None = None,
+    resoluteness: bool = True,
+) -> BudgetAllocation:
     """
-    The input is:
-    - voters: list of approval sets, where voters[i] is the approval set of voter i
-    - costs: dictionary mapping each project to its cost
-    - budget: total available budget
+    The Ordered-Relax rule for Maxmin Participatory Budgeting.
 
-    The output is a feasible set of selected projects.
+    Ordered-Relax is an LP-rounding algorithm for the Maxmin Participatory
+    Budgeting (MPB) objective. It first solves the LP relaxation of the MPB
+    integer linear program. Each project p is then assigned the score
+    ``p.cost * x[p]``, where ``x[p]`` is the value of p in the optimal relaxed
+    solution. Projects are considered in decreasing order of this score and are
+    added to the budget allocation until the next project in the order does not
+    fit within the remaining budget.
 
-    Important:
-    These doctests assume deterministic tie-breaking according to the insertion
-    order of the projects in the `costs` dictionary.
+    Contributed by Nevo Biton.
 
-    Example 1: size 1
+    Parameters
+    ----------
+        instance : :py:class:`~pabutools.election.instance.Instance`
+            The instance.
+        profile : :py:class:`~pabutools.election.profile.approvalprofile.AbstractApprovalProfile`
+            The approval profile.
+        initial_budget_allocation : Iterable[:py:class:`~pabutools.election.instance.Project`]
+            An initial budget allocation, typically empty.
+        tie_breaking : :py:class:`~pabutools.tiebreaking.TieBreakingRule`, optional
+            The tie-breaking rule used to order projects with the same Ordered-Relax score.
+            Defaults to the lexicographic tie-breaking.
+        resoluteness : bool, optional
+            Set to `False` to obtain an irresolute outcome, where all tied budget allocations are returned.
+            Defaults to True.
 
-    >>> voters = [
-    ...     {"p1"},
-    ... ]
-    >>> costs = {
-    ...     "p1": 5,
-    ... }
-    >>> budget = 5
-    >>> ordered_relax(voters, costs, budget) == {"p1"}
-    True
+    Returns
+    -------
+        :py:class:`~pabutools.rules.budgetallocation.BudgetAllocation`
+            The selected projects.
 
-    Example 2: size 2
+    Examples
+    --------
+        >>> from pabutools.election import Instance, Project, ApprovalBallot, ApprovalProfile
+        >>> def make_election(costs, budget, approvals):
+        ...     projects = {name: Project(name, cost) for name, cost in costs.items()}
+        ...     instance = Instance(projects.values(), budget_limit=budget)
+        ...     profile = ApprovalProfile([
+        ...         ApprovalBallot({projects[name] for name in ballot})
+        ...         for ballot in approvals
+        ...     ])
+        ...     return instance, profile
+        >>> def selected_names(allocation):
+        ...     return {project.name for project in allocation}
 
-    >>> voters = [
-    ...     {"p1"},
-    ...     {"p2"},
-    ... ]
-    >>> costs = {
-    ...     "p1": 4,
-    ...     "p2": 3,
-    ... }
-    >>> budget = 4
-    >>> ordered_relax(voters, costs, budget) == {"p1"}
-    True
+        Example 1.
 
-    Example 3: size 3
+        >>> instance, profile = make_election(
+        ...     {"p1": 5},
+        ...     5,
+        ...     [
+        ...         {"p1"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p1"}
+        True
 
-    >>> voters = [
-    ...     {"p1", "p2"},
-    ...     {"p2"},
-    ...     {"p3"},
-    ... ]
-    >>> costs = {
-    ...     "p1": 3,
-    ...     "p2": 3,
-    ...     "p3": 2,
-    ... }
-    >>> budget = 5
-    >>> ordered_relax(voters, costs, budget) == {"p2", "p3"}
-    True
+        Example 2.
 
-    Example 4: ORDERED-RELAX works optimally
+        >>> instance, profile = make_election(
+        ...     {"p1": 4, "p2": 3},
+        ...     4,
+        ...     [
+        ...         {"p1"},
+        ...         {"p2"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p1"}
+        True
 
-    >>> voters = [
-    ...     {"p0", "p1"},
-    ...     {"p0", "p2"},
-    ...     {"p0", "p3"},
-    ...     {"p0", "p4"},
-    ... ]
-    >>> costs = {
-    ...     "p0": 2,
-    ...     "p1": 3,
-    ...     "p2": 3,
-    ...     "p3": 3,
-    ...     "p4": 3,
-    ... }
-    >>> budget = 8
-    >>> ordered_relax(voters, costs, budget) == {"p0", "p1", "p2"}
-    True
+        Example 3.
 
-    Example 5: ORDERED-RELAX works poorly
+        >>> instance, profile = make_election(
+        ...     {"p1": 3, "p2": 3, "p3": 2},
+        ...     5,
+        ...     [
+        ...         {"p1", "p2"},
+        ...         {"p2"},
+        ...         {"p3"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p2", "p3"}
+        True
 
-    >>> voters = [
-    ...     {"p4"},
-    ...     {"p1", "p2"},
-    ...     {"p1", "p3", "p5"},
-    ... ]
-    >>> costs = {
-    ...     "p0": 23,
-    ...     "p1": 68,
-    ...     "p2": 198,
-    ...     "p3": 189,
-    ...     "p4": 146,
-    ...     "p5": 38,
-    ... }
-    >>> budget = 341
-    >>> ordered_relax(voters, costs, budget) == {"p4"}
-    True
+        Example 4.
 
-    Example 6: larger ORDERED-RELAX instance
+        >>> instance, profile = make_election(
+        ...     {
+        ...         "p0": 2,
+        ...         "p1": 3,
+        ...         "p2": 3,
+        ...         "p3": 3,
+        ...         "p4": 3,
+        ...     },
+        ...     8,
+        ...     [
+        ...         {"p0", "p1"},
+        ...         {"p0", "p2"},
+        ...         {"p0", "p3"},
+        ...         {"p0", "p4"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p0", "p1", "p2"}
+        True
 
-    >>> voters = [
-    ...     {"p0", "p3", "p7"},
-    ...     {"p1", "p4", "p6", "p7"},
-    ...     {"p0", "p2", "p4", "p5"},
-    ...     {"p1", "p6", "p9"},
-    ...     {"p1", "p2", "p6", "p7", "p8"},
-    ...     {"p1", "p3", "p4", "p6", "p8"},
-    ... ]
-    >>> costs = {
-    ...     "p0": 18,
-    ...     "p1": 45,
-    ...     "p2": 43,
-    ...     "p3": 32,
-    ...     "p4": 28,
-    ...     "p5": 32,
-    ...     "p6": 5,
-    ...     "p7": 37,
-    ...     "p8": 43,
-    ...     "p9": 17,
-    ... }
-    >>> budget = 124
-    >>> ordered_relax(voters, costs, budget) == {"p1", "p2"}
-    True
+        Example 5.
+
+        >>> instance, profile = make_election(
+        ...     {
+        ...         "p0": 23,
+        ...         "p1": 68,
+        ...         "p2": 198,
+        ...         "p3": 189,
+        ...         "p4": 146,
+        ...         "p5": 38,
+        ...     },
+        ...     341,
+        ...     [
+        ...         {"p4"},
+        ...         {"p1", "p2"},
+        ...         {"p1", "p3", "p5"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p4"}
+        True
+
+        Example 6.
+
+        >>> instance, profile = make_election(
+        ...     {
+        ...         "p0": 18,
+        ...         "p1": 45,
+        ...         "p2": 43,
+        ...         "p3": 32,
+        ...         "p4": 28,
+        ...         "p5": 32,
+        ...         "p6": 5,
+        ...         "p7": 37,
+        ...         "p8": 43,
+        ...         "p9": 17,
+        ...     },
+        ...     124,
+        ...     [
+        ...         {"p0", "p3", "p7"},
+        ...         {"p1", "p4", "p6", "p7"},
+        ...         {"p0", "p2", "p4", "p5"},
+        ...         {"p1", "p6", "p9"},
+        ...         {"p1", "p2", "p6", "p7", "p8"},
+        ...         {"p1", "p3", "p4", "p6", "p8"},
+        ...     ],
+        ... )
+        >>> selected_names(ordered_relax(instance, profile)) == {"p1", "p2"}
+        True
+
+    Notes
+    -----
+        Ordered-Relax is not guaranteed to return an optimal MPB outcome on
+        every instance. It is an approximation algorithm based on LP rounding.
+
+        The utility of a voter from a budget allocation is the total cost of the
+        selected projects approved by that voter.
     """
     pass
-
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod()
