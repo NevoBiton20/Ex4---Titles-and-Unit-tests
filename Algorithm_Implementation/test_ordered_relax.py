@@ -6,6 +6,7 @@ Tests for the algorithm described in:
 Programmer: Nevo Biton
 Date: 2026-04-29
 '''
+
 from itertools import combinations
 import random
 
