@@ -1,6 +1,11 @@
-"""
-The Ordered-Relax rule.
-"""
+'''
+An implementation of the algorithm described in:
+
+"Maxmin Participatory Budgeting", by Gogulapati Sreedurga , Mayank Ratan Bhardwaj and Y. Narahari, 2022, https://arxiv.org/pdf/2204.13923
+
+Programmer: Nevo Biton
+Date: 2026-04-29
+'''
 
 from __future__ import annotations
 
